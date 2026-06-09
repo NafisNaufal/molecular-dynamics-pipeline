@@ -133,12 +133,20 @@ grep -E "^(ATOM|SSBOND|SEQRES|TER|END)" "$INPUT_PDB" \
 ATOM_CLEAN=$(grep -c "^ATOM" clean_input.pdb || true)
 ok "clean_input.pdb written: $ATOM_CLEAN ATOM records retained"
 
-# ── Inject SSBOND records from SG–SG distance (< 3.0 Å) ──────────────────────
-# RFAntibody/ProteinMPNN outputs omit SSBOND records.  pdb2gmx reads SSBOND
-# records directly from the PDB (no stdin prompt needed) — this is more
-# reliable than the -ss interactive mode in GROMACS 2026.
+# ── Inject SSBOND records + fix SG–SG geometry for pdb2gmx -ss detection ──────
+# RFAntibody/ProteinMPNN outputs omit SSBOND records and sometimes produce
+# SG–SG distances above GROMACS 2026's specbond.dat detection threshold
+# (1.25 × 0.2 nm = 2.5 Å).  We:
+#   1. Detect CYS SG pairs within 3.0 Å.
+#   2. Snap both SGs to the ideal SS bond length (2.04 Å) if distance > 2.1 Å.
+#   3. Inject a SSBOND record (belt-and-suspenders).
+# pdb2gmx is then called with -ss so it interactively confirms each pair.
 python3 - << 'PYEOF'
 import sys, math
+
+SS_IDEAL   = 2.04   # Å — target SG–SG bond length after snap
+SS_SNAP_LO = 2.1    # Å — only snap if current distance is above this
+SS_DETECT  = 3.0    # Å — pairs within this are treated as potential disulfides
 
 pdb = 'clean_input.pdb'
 with open(pdb) as f:
@@ -148,9 +156,9 @@ with open(pdb) as f:
 if any(l.startswith('SSBOND') for l in lines):
     sys.exit(0)
 
-# Parse all CYS SG coordinates
+# Parse all CYS SG coordinates, remembering line index for coordinate patching
 cys_sg = []
-for line in lines:
+for idx, line in enumerate(lines):
     if (line.startswith('ATOM')
             and line[12:16].strip() == 'SG'
             and line[17:20].strip() == 'CYS'):
@@ -159,29 +167,45 @@ for line in lines:
         x = float(line[30:38])
         y = float(line[38:46])
         z = float(line[46:54])
-        cys_sg.append((chain, resnum, x, y, z))
+        cys_sg.append((chain, resnum, x, y, z, idx))
 
-# Find pairs closer than 3.0 Å — these should be disulfide bonds
+# Find pairs within SS_DETECT Å — these are disulfide candidates
 pairs = []
 for i in range(len(cys_sg)):
     for j in range(i + 1, len(cys_sg)):
-        c1, r1, x1, y1, z1 = cys_sg[i]
-        c2, r2, x2, y2, z2 = cys_sg[j]
+        c1, r1, x1, y1, z1, li1 = cys_sg[i]
+        c2, r2, x2, y2, z2, li2 = cys_sg[j]
         d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
-        if d < 3.0:
-            pairs.append((c1, r1, c2, r2, d))
+        if d < SS_DETECT:
+            pairs.append((c1, r1, x1, y1, z1, li1, c2, r2, x2, y2, z2, li2, d))
 
 if not pairs:
     sys.exit(0)
 
-# Build PDB SSBOND records and prepend to file
 ssbond_lines = []
-for i, (c1, r1, c2, r2, d) in enumerate(pairs, 1):
+for i, (c1, r1, x1, y1, z1, li1, c2, r2, x2, y2, z2, li2, d) in enumerate(pairs, 1):
+    # Snap SG coordinates to SS_IDEAL if distance is above SS_SNAP_LO
+    # (GROMACS specbond.dat threshold = 1.25 × 0.2 nm = 2.5 Å; designs from
+    # RFdiffusion can have SG–SG at 2.5–2.7 Å, just outside the threshold)
+    if d > SS_SNAP_LO:
+        mx = (x1+x2)/2;  my = (y1+y2)/2;  mz = (z1+z2)/2
+        dx = x1-x2;      dy = y1-y2;      dz = z1-z2
+        half = (SS_IDEAL / 2) / d
+        nx1 = mx + dx*half;  ny1 = my + dy*half;  nz1 = mz + dz*half
+        nx2 = mx - dx*half;  ny2 = my - dy*half;  nz2 = mz - dz*half
+        old1 = lines[li1]
+        lines[li1] = old1[:30] + f'{nx1:8.3f}{ny1:8.3f}{nz1:8.3f}' + old1[54:]
+        old2 = lines[li2]
+        lines[li2] = old2[:30] + f'{nx2:8.3f}{ny2:8.3f}{nz2:8.3f}' + old2[54:]
+        print(f'  [SS-snap] CYS-{c1}{r1}--CYS-{c2}{r2}: {d:.2f} Å → {SS_IDEAL:.2f} Å',
+              file=sys.stderr)
+        d = SS_IDEAL
+
     ssbond_lines.append(
         f"SSBOND {i:3d} CYS {c1} {r1:4d}    CYS {c2} {r2:4d}"
         f"                       {d:5.2f}  \n"
     )
-    print(f"  [SSBOND] CYS-{c1}{r1} -- CYS-{c2}{r2}  ({d:.2f} Å)", file=sys.stderr)
+    print(f'  [SSBOND] CYS-{c1}{r1} -- CYS-{c2}{r2}  ({d:.2f} Å)', file=sys.stderr)
 
 with open(pdb, 'w') as f:
     f.writelines(ssbond_lines)
@@ -204,22 +228,15 @@ PDB2GMX_ARGS=(
     -ignh         # discard input H atoms; rebuild from FF definitions
 )
 
-# Always use -ss: pdb2gmx scans SG/SD distances and asks about each potential
-# disulfide; piping 'yes y' confirms them all.  This is required because
-# RFAntibody/ProteinMPNN outputs often omit SSBOND records even when the
-# conserved nanobody Cys22–Cys96 disulfide geometry (SG–SG ≈ 0.20 nm) is
-# present.  Without -ss, pdb2gmx adds an SH hydrogen to each free cysteine —
-# placing it at 0.135 nm from the partner SG and causing Fmax = inf in EM.
-[[ "$SS_N" -gt 0 ]] && log "SSBOND record(s) found in PDB — disulfide(s) will be bonded."
-log "Running pdb2gmx with -ss (confirms all SG/SD pairs within bonding distance)"
-# Temporarily disable pipefail: 'yes y' gets SIGPIPE (exit 141) when pdb2gmx
-# closes stdin after it finishes reading — that non-zero exit would otherwise
-# abort the script even though pdb2gmx itself succeeded.
+[[ "$SS_N" -gt 0 ]] && log "SSBOND record(s) in source PDB — passed to pdb2gmx."
+# Run pdb2gmx with -ss.  Any CYS SG pair within 2.5 Å (specbond.dat threshold)
+# prompts an interactive question; pipe "y\n" for each possible pair.
+# set +o pipefail avoids SIGPIPE 141 when pdb2gmx closes stdin before 'yes' is done.
 set +o pipefail
 yes y 2>/dev/null | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
-PDB2GMX_STATUS="${PIPESTATUS[1]}"
+PDB2GMX_RC="${PIPESTATUS[1]}"
 set -o pipefail
-[[ "$PDB2GMX_STATUS" -eq 0 ]] || die "pdb2gmx failed (exit $PDB2GMX_STATUS) — check topology errors above"
+[[ "$PDB2GMX_RC" -eq 0 ]] || die "pdb2gmx failed (exit ${PDB2GMX_RC})"
 ok "pdb2gmx done → processed.gro, topol.top"
 
 # =============================================================================
