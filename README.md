@@ -1,6 +1,6 @@
-# Nanobody MD Pre-Production Pipeline
+# Nanobody MD Pipeline — E. faecalis Virulence Targets
 
-All-atom GROMACS pipeline to prepare nanobody–target complex PDB files (from **RFAntibody**) for molecular dynamics simulation — through energy minimisation, NVT equilibration, and NPT equilibration, stopping just before production MD.
+End-to-end all-atom GROMACS pipeline: PDB preparation → energy minimisation → equilibration → **100 ns production MD** → trajectory analysis and charts.
 
 **Targets:** Ace, EbpC, Esp (*Enterococcus faecalis* virulence proteins)  
 **Nanobodies:** VHH scaffolds designed by RFdiffusion + ProteinMPNN (RFAntibody)  
@@ -12,21 +12,40 @@ All-atom GROMACS pipeline to prepare nanobody–target complex PDB files (from *
 
 ```
 .
-├── setup_gmx.sh   # Single-complex pipeline (one PDB → npt.gro)
-├── run_all.sh     # Batch wrapper — loops all PDBs in ./design/
-└── design/        # Input PDB files (nanobody + target, docked)
+├── setup_gmx.sh       # Single-complex pre-production pipeline (one PDB → npt.gro)
+├── run_all.sh         # Batch pre-production (all 9 PDBs)
+├── run_production.sh  # Batch 100 ns production MD
+├── run_analysis.sh    # GROMACS analysis tools + calls analyze.py
+├── analyze.py         # Python charts (RMSD, RMSF, Rg, H-bonds, contacts, MM-PBSA)
+├── run_mmpbsa.sh      # MM-GBSA binding free energies (gmx_MMPBSA)
+└── design/            # Input PDB files (nanobody + target, docked)
     ├── ace_1.pdb   ace_2.pdb   ace_3.pdb
     ├── ebpc_1.pdb  ebpc_2.pdb  ebpc_3.pdb
     └── esp_1.pdb   esp_2.pdb   esp_3.pdb
 ```
 
-Outputs land in:
+Outputs:
 
 ```
 runs/
-├── ace_1/    ace_2/    ace_3/      ← full GROMACS tree per complex
-├── ebpc_1/   ebpc_2/   ebpc_3/
-└── esp_1/    esp_2/    esp_3/
+└── ace_1/
+    ├── npt.gro, npt.cpt, topol.top   ← pre-production outputs
+    ├── md.tpr, md.xtc                ← 100 ns production
+    ├── md_center.xtc                 ← centred trajectory
+    ├── index.ndx                     ← Nanobody + Target groups
+    └── analysis/
+        ├── rmsd_backbone.xvg
+        ├── rmsf_ca.xvg
+        ├── gyrate.xvg
+        ├── hbnum.xvg
+        ├── mindist.xvg
+        └── contacts.xvg
+
+plots/
+├── ace_1_rmsd_backbone.png           ← individual system charts
+├── ace/rmsd_backbone_comparison.png  ← designs 1–3 overlaid per target
+├── summary_bars.png
+└── mmpbsa_binding_energy.png
 ```
 
 ---
@@ -65,21 +84,33 @@ gmx_mpi --version   # should print 2023.4
 
 ## Usage
 
-### Run all 9 complexes (recommended)
+### Install Python dependencies
 
 ```bash
-# JupyterHub: wrap in nohup so the job survives session disconnect
-nohup ./run_all.sh > batch.log 2>&1 &
-echo "PID: $!"
+# Analysis + plotting
+micromamba install -y -c conda-forge numpy matplotlib pandas
 
-# Watch progress from another terminal / Jupyter cell
-tail -f batch.log
+# MM-PBSA (optional — needed only for binding free energies)
+pip install gmx_MMPBSA
 ```
 
-`run_all.sh` defaults to `./design/` as the PDB directory. Pass an explicit path to override:
+### Full workflow (4 steps)
 
 ```bash
-./run_all.sh /path/to/other/pdbs/
+# ── Step 1: Pre-production (EM + NVT + NPT) ──────────────────────────────────
+nohup ./run_all.sh > batch_prep.log 2>&1 &
+tail -f batch_prep.log
+
+# ── Step 2: 100 ns production MD ─────────────────────────────────────────────
+nohup ./run_production.sh > batch_prod.log 2>&1 &
+tail -f batch_prod.log
+
+# ── Step 3: Trajectory analysis + charts ─────────────────────────────────────
+./run_analysis.sh               # generates ./plots/
+
+# ── Step 4: MM-PBSA binding energies (optional, ~1–4 h/system) ───────────────
+./run_mmpbsa.sh
+python3 analyze.py              # re-run to include MM-PBSA bars
 ```
 
 ### Run a single complex
@@ -150,17 +181,24 @@ grep '^ATOM' design/ace_1.pdb | awk '{print $6}' | sort -n | tail -3   # last re
 
 ---
 
-## Next step — production MD
+## Charts produced by analyze.py
 
-After the pipeline completes, create `md.mdp` (based on `npt.mdp`, remove `-DPOSRES`, increase `nsteps`):
+| Chart | Description |
+|-------|-------------|
+| `<stem>_rmsd_backbone.png` | Backbone RMSD vs time (ns) — raw + smoothed |
+| `<stem>_rmsd_nanobody.png` | Nanobody-only RMSD vs time |
+| `<stem>_rmsd_target.png` | Target-only RMSD vs time |
+| `<stem>_rmsf.png` | Cα RMSF per residue |
+| `<stem>_gyrate.png` | Radius of gyration vs time |
+| `<stem>_hbonds.png` | Interface H-bond count vs time |
+| `<stem>_mindist.png` | Interface minimum distance vs time |
+| `<stem>_contacts.png` | Interface contact count (<0.35 nm) vs time |
+| `<target>/rmsd_backbone_comparison.png` | 3 designs overlaid for one target |
+| `<target>/rmsf_comparison.png` | RMSF overlay |
+| `summary_bars.png` | All 9 systems: mean RMSD, Rg, H-bonds, contacts, min-dist |
+| `mmpbsa_binding_energy.png` | ΔG binding bar chart (after run_mmpbsa.sh) |
 
-```bash
-cd runs/ace_1/
-gmx_mpi grompp -f md.mdp -c npt.gro -r npt.gro -p topol.top -t npt.cpt -o md.tpr
-gmx_mpi mdrun  -v -deffnm md \
-    -ntomp 8 -gpu_id 0 \
-    -nb gpu -pme gpu -bonded gpu -update gpu -pin on
-```
+All plots: 300 DPI PNG, dark/medium/light shading per design within each target colour family.
 
 ---
 
@@ -185,3 +223,7 @@ CPU_THREADS=8   # OpenMP threads; increase if you have more cores per GPU (check
 | `genion` group not found | Replace `"SOL"` with the group number shown by `gmx_mpi make_ndx` |
 | GPU offload error on mdrun | Remove `-update gpu` from the mdrun call in `setup_gmx.sh` (requires GROMACS ≥ 2021 with CUDA) |
 | JupyterHub session killed | Always use `nohup ./run_all.sh > batch.log 2>&1 &` |
+| `gmx_MMPBSA not found` | `pip install gmx_MMPBSA` then re-activate env |
+| MM-PBSA group not found | `run_production.sh` must complete first to create `index.ndx` |
+| RMSF shows only one chain | Expected — both chains are merged; chain boundary marked with dashed line |
+| `matplotlib` import error | `micromamba install -y -c conda-forge numpy matplotlib pandas` |

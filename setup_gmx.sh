@@ -107,7 +107,7 @@ fi
     warn "Stripping $HOH_N crystallographic water atom(s) — TIP3P added later."
 
 [[ "$SS_N" -gt 0 ]] && \
-    log "Found $SS_N SSBOND record(s) → disulfide mode will be enabled in pdb2gmx."
+    log "Found $SS_N SSBOND record(s) in PDB (will also scan by distance via -ss)."
 
 log "Chain IDs detected: [${CHAIN_IDS}]"
 
@@ -149,13 +149,15 @@ PDB2GMX_ARGS=(
     -ignh         # discard input H atoms; rebuild from FF definitions
 )
 
-if [[ "$SS_N" -gt 0 ]]; then
-    log "Disulfide bonds: piping 'y' for each detected SS pair (pdb2gmx -ss)"
-    # 'yes y' pipes until pdb2gmx closes stdin; suppress SIGPIPE with 2>/dev/null
-    yes y 2>/dev/null | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
-else
-    ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}"
-fi
+# Always use -ss: pdb2gmx scans SG/SD distances and asks about each potential
+# disulfide; piping 'yes y' confirms them all.  This is required because
+# RFAntibody/ProteinMPNN outputs often omit SSBOND records even when the
+# conserved nanobody Cys22–Cys96 disulfide geometry (SG–SG ≈ 0.20 nm) is
+# present.  Without -ss, pdb2gmx adds an SH hydrogen to each free cysteine —
+# placing it at 0.135 nm from the partner SG and causing Fmax = inf in EM.
+[[ "$SS_N" -gt 0 ]] && log "SSBOND record(s) found in PDB — disulfide(s) will be bonded."
+log "Running pdb2gmx with -ss (confirms all SG/SD pairs within bonding distance)"
+yes y 2>/dev/null | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
 ok "pdb2gmx done → processed.gro, topol.top"
 
 # =============================================================================
@@ -360,6 +362,17 @@ ${GMX} mdrun -v -deffnm em \
     -gpu_id "${GPU_ID}" \
     -nb gpu -pin on
 
+# Verify EM converged — Fmax=inf means atom overlap (usually bad disulfide handling)
+if grep -q "force on at least one atom is not finite" em.log 2>/dev/null; then
+    die "EM crashed: Fmax = inf (atom overlap in initial structure).\n\
+  Most likely cause: a disulfide bond detected by SG–SG distance but not\n\
+  bonded in topology.  Check em.log for the 'Special Atom Distance Matrix'\n\
+  — look for SG–SG < 0.26 nm.  The -ss fix should have caught this;\n\
+  verify that clean_input.pdb has valid PDB ATOM records and retry."
+fi
+if ! grep -qE "converged to Fmax|converged to machine precision" em.log 2>/dev/null; then
+    warn "EM did not produce a clear convergence line in em.log — check em.log"
+fi
 ok "Energy minimisation done → em.gro"
 
 # =============================================================================
