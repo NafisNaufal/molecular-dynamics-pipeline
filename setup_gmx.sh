@@ -157,7 +157,14 @@ PDB2GMX_ARGS=(
 # placing it at 0.135 nm from the partner SG and causing Fmax = inf in EM.
 [[ "$SS_N" -gt 0 ]] && log "SSBOND record(s) found in PDB — disulfide(s) will be bonded."
 log "Running pdb2gmx with -ss (confirms all SG/SD pairs within bonding distance)"
+# Temporarily disable pipefail: 'yes y' gets SIGPIPE (exit 141) when pdb2gmx
+# closes stdin after it finishes reading — that non-zero exit would otherwise
+# abort the script even though pdb2gmx itself succeeded.
+set +o pipefail
 yes y 2>/dev/null | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
+PDB2GMX_STATUS="${PIPESTATUS[1]}"
+set -o pipefail
+[[ "$PDB2GMX_STATUS" -eq 0 ]] || die "pdb2gmx failed (exit $PDB2GMX_STATUS) — check topology errors above"
 ok "pdb2gmx done → processed.gro, topol.top"
 
 # =============================================================================
