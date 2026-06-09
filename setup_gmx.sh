@@ -133,6 +133,61 @@ grep -E "^(ATOM|SSBOND|SEQRES|TER|END)" "$INPUT_PDB" \
 ATOM_CLEAN=$(grep -c "^ATOM" clean_input.pdb || true)
 ok "clean_input.pdb written: $ATOM_CLEAN ATOM records retained"
 
+# ── Inject SSBOND records from SG–SG distance (< 3.0 Å) ──────────────────────
+# RFAntibody/ProteinMPNN outputs omit SSBOND records.  pdb2gmx reads SSBOND
+# records directly from the PDB (no stdin prompt needed) — this is more
+# reliable than the -ss interactive mode in GROMACS 2026.
+python3 - << 'PYEOF'
+import sys, math
+
+pdb = 'clean_input.pdb'
+with open(pdb) as f:
+    lines = f.readlines()
+
+# Skip if SSBOND records already present
+if any(l.startswith('SSBOND') for l in lines):
+    sys.exit(0)
+
+# Parse all CYS SG coordinates
+cys_sg = []
+for line in lines:
+    if (line.startswith('ATOM')
+            and line[12:16].strip() == 'SG'
+            and line[17:20].strip() == 'CYS'):
+        chain  = line[21]
+        resnum = int(line[22:26].strip())
+        x = float(line[30:38])
+        y = float(line[38:46])
+        z = float(line[46:54])
+        cys_sg.append((chain, resnum, x, y, z))
+
+# Find pairs closer than 3.0 Å — these should be disulfide bonds
+pairs = []
+for i in range(len(cys_sg)):
+    for j in range(i + 1, len(cys_sg)):
+        c1, r1, x1, y1, z1 = cys_sg[i]
+        c2, r2, x2, y2, z2 = cys_sg[j]
+        d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+        if d < 3.0:
+            pairs.append((c1, r1, c2, r2, d))
+
+if not pairs:
+    sys.exit(0)
+
+# Build PDB SSBOND records and prepend to file
+ssbond_lines = []
+for i, (c1, r1, c2, r2, d) in enumerate(pairs, 1):
+    ssbond_lines.append(
+        f"SSBOND {i:3d} CYS {c1} {r1:4d}    CYS {c2} {r2:4d}"
+        f"                       {d:5.2f}  \n"
+    )
+    print(f"  [SSBOND] CYS-{c1}{r1} -- CYS-{c2}{r2}  ({d:.2f} Å)", file=sys.stderr)
+
+with open(pdb, 'w') as f:
+    f.writelines(ssbond_lines)
+    f.writelines(lines)
+PYEOF
+
 # =============================================================================
 # STEP 1 — pdb2gmx: topology + force field
 # =============================================================================
@@ -369,16 +424,21 @@ ${GMX} mdrun -v -deffnm em \
     -gpu_id "${GPU_ID}" \
     -nb gpu -pin on
 
-# Verify EM converged — Fmax=inf means atom overlap (usually bad disulfide handling)
-if grep -q "force on at least one atom is not finite" em.log 2>/dev/null; then
-    die "EM crashed: Fmax = inf (atom overlap in initial structure).\n\
-  Most likely cause: a disulfide bond detected by SG–SG distance but not\n\
-  bonded in topology.  Check em.log for the 'Special Atom Distance Matrix'\n\
-  — look for SG–SG < 0.26 nm.  The -ss fix should have caught this;\n\
-  verify that clean_input.pdb has valid PDB ATOM records and retry."
+# Verify EM outcome — GROMACS splits the infinite-force error across two lines:
+#   "...the force on at least one atom is not\nfinite."
+# so we match on the single-line phrase that always appears just before it.
+if grep -q "Energy minimization has stopped" em.log 2>/dev/null; then
+    die "EM crashed: infinite force (Fmax = inf) — atom overlap in initial structure.\n\
+  Check em.log for the 'Special Atom Distance Matrix' — look for SG–SG < 3 Å.\n\
+  If a disulfide exists but no SSBOND record was injected, verify that\n\
+  clean_input.pdb has valid ATOM records with correct residue names (CYS)."
 fi
-if ! grep -qE "converged to Fmax|converged to machine precision" em.log 2>/dev/null; then
-    warn "EM did not produce a clear convergence line in em.log — check em.log"
+# "converged to machine precision" means EM hit the step-size floor WITHOUT
+# reaching Fmax < emtol — the structure may still have bad geometry.
+if grep -q "converged to machine precision" em.log 2>/dev/null \
+        && grep -q "did not reach the requested Fmax" em.log 2>/dev/null; then
+    warn "EM converged to machine precision but Fmax > emtol — structure may still be strained."
+    warn "Check em.log and consider increasing EM_STEPS or reducing emstep in minim.mdp."
 fi
 ok "Energy minimisation done → em.gro"
 
