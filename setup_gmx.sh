@@ -64,7 +64,7 @@ run_md() {
     ${GMX} mdrun -v -deffnm "$1" \
         -ntomp "${CPU_THREADS}" \
         -gpu_id "${GPU_ID}" \
-        -nb gpu -pme gpu -bonded gpu -update gpu \
+        -nb gpu -pme gpu -bonded gpu \
         -pin on "$@"
 }
 
@@ -459,7 +459,7 @@ ${GMX} grompp \
 ${GMX} mdrun -v -deffnm nvt \
     -ntomp "${CPU_THREADS}" \
     -gpu_id "${GPU_ID}" \
-    -nb gpu -pme gpu -bonded gpu -update gpu \
+    -nb gpu -pme gpu -bonded gpu \
     -pin on
 
 ok "NVT equilibration done → nvt.gro"
@@ -481,7 +481,7 @@ ${GMX} grompp \
 ${GMX} mdrun -v -deffnm npt \
     -ntomp "${CPU_THREADS}" \
     -gpu_id "${GPU_ID}" \
-    -nb gpu -pme gpu -bonded gpu -update gpu \
+    -nb gpu -pme gpu -bonded gpu \
     -pin on
 
 ok "NPT equilibration done → npt.gro"
@@ -506,6 +506,6 @@ cat << 'NEXT'
   gmx_mpi grompp -f md.mdp -c npt.gro -r npt.gro -p topol.top -t npt.cpt -o md.tpr
   gmx_mpi mdrun  -v -deffnm md \
       -ntomp 8 -gpu_id 0 \
-      -nb gpu -pme gpu -bonded gpu -update gpu -pin on
+      -nb gpu -pme gpu -bonded gpu -pin on
 
 NEXT

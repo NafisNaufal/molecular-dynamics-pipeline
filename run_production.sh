@@ -117,7 +117,7 @@ MDP
     ${GMX} mdrun -v -deffnm md \
         -ntomp "${CPU_THREADS}" \
         -gpu_id "${GPU_ID}" \
-        -nb gpu -pme gpu -bonded gpu -update gpu \
+        -nb gpu -pme gpu -bonded gpu \
         -pin on
 
     T_END=$(date +%s)
