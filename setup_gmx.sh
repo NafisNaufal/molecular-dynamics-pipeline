@@ -423,21 +423,23 @@ ${GMX} mdrun -v -deffnm em \
     -gpu_id "${GPU_ID}" \
     -nb gpu -pin on
 
-# Verify EM outcome — GROMACS splits the infinite-force error across two lines:
-#   "...the force on at least one atom is not\nfinite."
-# so we match on the single-line phrase that always appears just before it.
-if grep -q "Energy minimization has stopped" em.log 2>/dev/null; then
+# Verify EM outcome.  Two distinct GROMACS stop conditions both write
+# "Energy minimization has stopped" to em.log, so we must distinguish them:
+#
+#   "converged to machine precision" → Fmax is finite but > emtol; PE is
+#       large-negative (physically reasonable).  NVT position restraints will
+#       relax residual strain — this is a warning, not a fatal error.
+#
+#   "not finite" → Fmax = inf at step 0; PE = +inf; atom overlap.  Fatal.
+#
+# Check the benign case first so the elif never fires for machine-precision runs.
+if grep -q "converged to machine precision" em.log 2>/dev/null; then
+    warn "EM converged to machine precision (Fmax > emtol). NVT will relax residual strain."
+elif grep -q "not finite" em.log 2>/dev/null \
+        || grep -q "Energy minimization has stopped" em.log 2>/dev/null; then
     die "EM crashed: infinite force (Fmax = inf) — atom overlap in initial structure.\n\
   Check em.log for the 'Special Atom Distance Matrix' — look for SG–SG < 3 Å.\n\
-  If a disulfide exists but no SSBOND record was injected, verify that\n\
-  clean_input.pdb has valid ATOM records with correct residue names (CYS)."
-fi
-# "converged to machine precision" means EM hit the step-size floor WITHOUT
-# reaching Fmax < emtol — the structure may still have bad geometry.
-if grep -q "converged to machine precision" em.log 2>/dev/null \
-        && grep -q "did not reach the requested Fmax" em.log 2>/dev/null; then
-    warn "EM converged to machine precision but Fmax > emtol — structure may still be strained."
-    warn "Check em.log and consider increasing EM_STEPS or reducing emstep in minim.mdp."
+  If a disulfide exists but pdb2gmx didn't form it, check clean_input.pdb CYS records."
 fi
 ok "Energy minimisation done → em.gro"
 
