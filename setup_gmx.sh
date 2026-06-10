@@ -309,7 +309,7 @@ step "Writing .mdp files  [minim / nvt / npt]"
 
 # ── minim.mdp ─────────────────────────────────────────────────────────────────
 cat > minim.mdp << MDP
-; ── Energy Minimisation (steepest descent) ────────────────────────────────────
+; ── Energy Minimisation Phase 1 (steepest descent) ───────────────────────────
 integrator              = steep
 emtol                   = 1000.0        ; kJ/mol/nm — convergence threshold
 emstep                  = 0.01
@@ -328,6 +328,33 @@ nstxout                 = 0
 nstvout                 = 0
 nstenergy               = 500
 nstlog                  = 500
+
+pbc                     = xyz
+MDP
+
+# ── minim2.mdp — L-BFGS refinement ───────────────────────────────────────────
+cat > minim2.mdp << MDP
+; ── Energy Minimisation Phase 2 (L-BFGS) — converges strained H geometry ────
+; Steepest descent stalls at machine precision when H atoms placed by -ignh
+; have bad geometry; L-BFGS uses gradient history to escape these flat regions.
+; Requires single-threaded CPU execution (not parallelised in GROMACS).
+integrator              = l-bfgs
+emtol                   = 500.0
+nsteps                  = 5000
+
+cutoff-scheme           = Verlet
+ns_type                 = grid
+nstlist                 = 1
+rcoulomb                = 1.0
+rvdw                    = 1.0
+coulombtype             = PME
+pme_order               = 4
+fourierspacing          = 0.16
+
+nstxout                 = 0
+nstvout                 = 0
+nstenergy               = 100
+nstlog                  = 100
 
 pbc                     = xyz
 MDP
@@ -454,15 +481,42 @@ ${GMX} mdrun -v -deffnm em \
 #   "not finite" → Fmax = inf at step 0; PE = +inf; atom overlap.  Fatal.
 #
 # Check the benign case first so the elif never fires for machine-precision runs.
-if grep -q "converged to machine precision" em.log 2>/dev/null; then
-    warn "EM converged to machine precision (Fmax > emtol). NVT will relax residual strain."
-elif grep -q "not finite" em.log 2>/dev/null \
-        || grep -q "Energy minimization has stopped" em.log 2>/dev/null; then
+if grep -q "not finite" em.log 2>/dev/null; then
     die "EM crashed: infinite force (Fmax = inf) — atom overlap in initial structure.\n\
   Check em.log for the 'Special Atom Distance Matrix' — look for SG–SG < 3 Å.\n\
-  If a disulfide exists but pdb2gmx didn't form it, check clean_input.pdb CYS records."
+  If a disulfide exists but pdb2gmx did not form it, check clean_input.pdb CYS records."
+elif grep -q "Energy minimization has stopped" em.log 2>/dev/null \
+        && ! grep -q "converged to machine precision" em.log 2>/dev/null; then
+    die "EM stopped unexpectedly — check em.log."
 fi
-ok "Energy minimisation done → em.gro"
+# "converged to machine precision" is not fatal; L-BFGS phase 2 below will reduce Fmax further.
+ok "Steepest-descent EM done → em.gro"
+
+# =============================================================================
+# STEP 5b — Energy Minimisation Phase 2 (L-BFGS)
+# =============================================================================
+step "STEP 5b: L-BFGS refinement  [max 5000 steps, emtol 500]"
+
+${GMX} grompp \
+    -f minim2.mdp \
+    -c em.gro \
+    -p topol.top \
+    -o em2.tpr \
+    -maxwarn 2
+
+# L-BFGS is not parallelised in GROMACS — must run single-threaded on CPU
+${GMX} mdrun -v -deffnm em2 \
+    -ntomp 1 \
+    -gpu_id "${GPU_ID}" \
+    -nb cpu -pin on
+
+if grep -q "not finite" em2.log 2>/dev/null; then
+    die "L-BFGS EM crashed (Fmax = inf). Check em2.log."
+fi
+if grep -q "converged to machine precision" em2.log 2>/dev/null; then
+    warn "L-BFGS also converged to machine precision. NVT position restraints will relax remaining strain."
+fi
+ok "L-BFGS refinement done → em2.gro"
 
 # =============================================================================
 # STEP 6 — NVT Equilibration
@@ -471,8 +525,8 @@ step "STEP 6: NVT Equilibration  [${NVT_STEPS} steps, ${TEMP} K]"
 
 ${GMX} grompp \
     -f nvt.mdp \
-    -c em.gro \
-    -r em.gro \
+    -c em2.gro \
+    -r em2.gro \
     -p topol.top \
     -o nvt.tpr \
     -maxwarn 2
