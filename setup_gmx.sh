@@ -213,9 +213,43 @@ PDB2GMX_ARGS=(
 [[ "$SS_N" -gt 0 ]] && log "SSBOND record(s) found in source PDB."
 # -ss scans for CYS SG pairs within specbond.dat threshold (2.5 Å) and prompts.
 # Coordinate snap above ensures RFdiffusion designs land within that threshold.
-# set +o pipefail prevents SIGPIPE 141 when pdb2gmx closes stdin before yes ends.
+#
+# 'yes y | pdb2gmx -ss' fails in GROMACS 2026: the first 'y' is consumed by
+# force-field initialisation before pdb2gmx reaches the (y/n) prompt, so the
+# actual disulfide question receives empty input and defaults to 'n'.
+# Fix: count expected prompts, then pipe (N_SS + 5) 'y' lines so there are
+# enough to cover both the extra pre-prompt reads AND the real SS questions.
+# printf exits after writing and closes the pipe (EOF), unlike 'yes'.
+N_SS=$(python3 - << 'PYEOF'
+import math, sys
+SS_THRESH = 2.5   # Angstroms (= 1.25 x 0.2 nm specbond.dat threshold)
+pdb = 'clean_input.pdb'
+cys_sg = []
+try:
+    with open(pdb) as f:
+        for line in f:
+            if (line.startswith('ATOM')
+                    and line[12:16].strip() == 'SG'
+                    and line[17:20].strip() == 'CYS'):
+                cys_sg.append((float(line[30:38]),
+                               float(line[38:46]),
+                               float(line[46:54])))
+except Exception:
+    sys.exit(0)
+count = 0
+for i in range(len(cys_sg)):
+    for j in range(i + 1, len(cys_sg)):
+        xi,yi,zi = cys_sg[i]; xj,yj,zj = cys_sg[j]
+        if math.sqrt((xi-xj)**2+(yi-yj)**2+(zi-zj)**2) < SS_THRESH:
+            count += 1
+print(count)
+PYEOF
+)
+log "Disulfide prompts expected: ${N_SS}"
+
 set +o pipefail
-yes y 2>/dev/null | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
+printf 'y\n%.0s' $(seq 1 $(( N_SS + 5 ))) \
+    | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
 PDB2GMX_RC="${PIPESTATUS[1]}"
 set -o pipefail
 [[ "$PDB2GMX_RC" -eq 0 ]] || die "pdb2gmx failed (exit ${PDB2GMX_RC})"
@@ -459,7 +493,7 @@ ${GMX} grompp \
 ${GMX} mdrun -v -deffnm nvt \
     -ntomp "${CPU_THREADS}" \
     -gpu_id "${GPU_ID}" \
-    -nb gpu -pme gpu -bonded gpu \
+    -nb gpu -pme gpu -bonded gpu -update gpu \
     -pin on
 
 ok "NVT equilibration done → nvt.gro"
@@ -481,7 +515,7 @@ ${GMX} grompp \
 ${GMX} mdrun -v -deffnm npt \
     -ntomp "${CPU_THREADS}" \
     -gpu_id "${GPU_ID}" \
-    -nb gpu -pme gpu -bonded gpu \
+    -nb gpu -pme gpu -bonded gpu -update gpu \
     -pin on
 
 ok "NPT equilibration done → npt.gro"
