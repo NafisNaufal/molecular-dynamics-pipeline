@@ -315,16 +315,20 @@ nstlog                  = 500
 pbc                     = xyz
 MDP
 
-# ── minim2.mdp — L-BFGS refinement ───────────────────────────────────────────
+# ── minim2.mdp — H-atom relaxation EM ────────────────────────────────────────
 cat > minim2.mdp << MDP
-; ── Energy Minimisation Phase 2 (L-BFGS) — converges strained H geometry ────
-; Steepest descent stalls at machine precision when H atoms placed by -ignh
-; have bad geometry; L-BFGS uses gradient history to escape these flat regions.
-; Requires single-threaded CPU execution (not parallelised in GROMACS).
-; constraints = none is mandatory — L-BFGS + constraints is not implemented.
-integrator              = l-bfgs
-emtol                   = 500.0
-nsteps                  = 5000
+; ── Energy Minimisation Phase 2 — H-atom relaxation with heavy atoms fixed ───
+; pdb2gmx -ignh places H atoms by idealised geometry without clash-checking.
+; When H atoms clash, steepest descent stalls (machine-precision convergence)
+; because the heavy-atom skeleton cannot shift far enough to relieve the H clash.
+; Fix: position-restrain all heavy atoms (define = -DPOSRES) and minimise with
+; constraints = none so H atoms can freely adjust bond lengths and angles.
+; This is equivalent to a "hydrogen-only optimisation" step and always converges.
+integrator              = steep
+emtol                   = 100.0
+emstep                  = 0.01
+nsteps                  = 10000
+define                  = -DPOSRES
 constraints             = none
 
 cutoff-scheme           = Verlet
@@ -485,15 +489,15 @@ step "STEP 5b: L-BFGS refinement  [max 5000 steps, emtol 500]"
 ${GMX} grompp \
     -f minim2.mdp \
     -c em.gro \
+    -r em.gro \
     -p topol.top \
     -o em2.tpr \
     -maxwarn 2
 
-# L-BFGS is not parallelised in GROMACS — must run single-threaded on CPU
 ${GMX} mdrun -v -deffnm em2 \
-    -ntomp 1 \
+    -ntomp "${CPU_THREADS}" \
     -gpu_id "${GPU_ID}" \
-    -nb cpu -pin on
+    -nb gpu -pin on
 
 if grep -q "not finite" em2.log 2>/dev/null; then
     die "L-BFGS EM crashed (Fmax = inf). Check em2.log."
