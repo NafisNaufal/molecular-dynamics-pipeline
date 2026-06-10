@@ -133,31 +133,29 @@ grep -E "^(ATOM|SSBOND|SEQRES|TER|END)" "$INPUT_PDB" \
 ATOM_CLEAN=$(grep -c "^ATOM" clean_input.pdb || true)
 ok "clean_input.pdb written: $ATOM_CLEAN ATOM records retained"
 
-# ── Snap close CYS SG pairs into disulfide detection range ────────────────────
-# RFdiffusion does not model disulfide bonds.  ProteinMPNN places CYS22/96 by
-# backbone geometry; the resulting SG–SG distance can be 2.0–2.8 Å — a range
-# that is "close enough to clash but sometimes outside pdb2gmx's specbond.dat
-# detection threshold" (1.25 × 0.2 nm = 2.5 Å).
+# ── Snap close same-chain CYS SG pairs into disulfide detection range ─────────
+# RFdiffusion + ProteinMPNN may place nanobody CYS22/CYS96 with SG–SG in 2.0–2.8 Å.
+# specbond.dat reference = 0.2 nm; auto-confirms if d < 2.0 Å, prompts if 2.0–2.5 Å.
 #
-# Strategy: for any CYS SG pair in (2.1, 3.0) Å, move both atoms symmetrically
-# to exactly 2.04 Å (ideal S–S bond length).  pdb2gmx -ss then reliably detects
-# all pairs ≤ 2.5 Å and prompts for confirmation; yes y answers every prompt.
-# We do NOT inject SSBOND records: combining them with -ss causes pdb2gmx 2026
-# to double-process the bond (once from the record, once from specbond.dat),
-# corrupting the topology for designs whose SG–SG is already at bond distance.
-python3 - << 'PYEOF'
+# Only intra-chain pairs are processed to prevent spurious inter-chain disulfides.
+# The target proteins (Ace, Esp) may contain CYS pairs in the 2.0–2.5 Å prompted
+# range; answering those prompts with "y" would corrupt the topology (invalid 1-4
+# pair indices → do_pairs segfault in EM).  We distinguish:
+#   • nanobody pair snapped to 1.99 Å → auto-confirmed (no prompt) → use /dev/null
+#   • nanobody pair at 2.0–2.1 Å (not snapped) → prompted → send exactly one "y",
+#     then close stdin so subsequent target-CYS prompts default to "n"
+SS_NEEDS_Y=$(python3 - << 'PYEOF'
 import sys, math
 
-SS_IDEAL   = 1.99   # Å — snap target; below specbond.dat ref (0.2 nm = 2.0 Å) so
-                   #      GROMACS 2026 auto-confirms without stdin interaction
+SS_IDEAL   = 1.99   # Å — snap target; below specbond.dat ref (2.0 Å) → auto-confirmed
 SS_SNAP_LO = 2.1    # Å — snap only if distance is above this
-SS_DETECT  = 3.0    # Å — pairs closer than this are disulfide candidates
+SS_DETECT  = 3.0    # Å — scan radius for disulfide candidates
+SS_REF     = 2.0    # Å — specbond.dat reference; pairs below this are auto-confirmed
 
 pdb = 'clean_input.pdb'
 with open(pdb) as f:
     lines = f.readlines()
 
-# Parse CYS SG atoms with their line index for in-place coordinate patching
 cys_sg = []
 for idx, line in enumerate(lines):
     if (line.startswith('ATOM')
@@ -170,30 +168,45 @@ for idx, line in enumerate(lines):
         z = float(line[46:54])
         cys_sg.append((chain, resnum, x, y, z, idx))
 
-snapped = False
+snapped      = False
+nb_prompted  = False   # True if a same-chain pair is in [2.0, 2.1) — pdb2gmx will prompt
+
 for i in range(len(cys_sg)):
     for j in range(i + 1, len(cys_sg)):
         c1, r1, x1, y1, z1, li1 = cys_sg[i]
         c2, r2, x2, y2, z2, li2 = cys_sg[j]
+        if c1 != c2:
+            continue          # skip inter-chain pairs — no cross-chain disulfides
         d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+
         if SS_SNAP_LO < d < SS_DETECT:
+            # Move both SG atoms symmetrically to SS_IDEAL
             mx = (x1+x2)/2;  my = (y1+y2)/2;  mz = (z1+z2)/2
             dx = x1-x2;      dy = y1-y2;      dz = z1-z2
             half = (SS_IDEAL / 2) / d
             nx1 = mx + dx*half;  ny1 = my + dy*half;  nz1 = mz + dz*half
             nx2 = mx - dx*half;  ny2 = my - dy*half;  nz2 = mz - dz*half
-            old1 = lines[li1]
-            lines[li1] = old1[:30] + f'{nx1:8.3f}{ny1:8.3f}{nz1:8.3f}' + old1[54:]
-            old2 = lines[li2]
-            lines[li2] = old2[:30] + f'{nx2:8.3f}{ny2:8.3f}{nz2:8.3f}' + old2[54:]
+            lines[li1] = lines[li1][:30] + f'{nx1:8.3f}{ny1:8.3f}{nz1:8.3f}' + lines[li1][54:]
+            lines[li2] = lines[li2][:30] + f'{nx2:8.3f}{ny2:8.3f}{nz2:8.3f}' + lines[li2][54:]
             print(f'  [SS-snap] CYS-{c1}{r1}--CYS-{c2}{r2}: {d:.2f} Å → {SS_IDEAL:.2f} Å',
                   file=sys.stderr)
             snapped = True
 
+        elif SS_REF <= d < SS_SNAP_LO:
+            # [2.0, 2.1) Å: pdb2gmx -ss will prompt (not auto-confirmed, not snapped)
+            nb_prompted = True
+            print(f'  [SS-prompt] CYS-{c1}{r1}--CYS-{c2}{r2}: {d:.2f} Å (will prompt → y)',
+                  file=sys.stderr)
+
 if snapped:
     with open(pdb, 'w') as f:
         f.writelines(lines)
+
+# stdout: 1 = send one explicit "y" for the prompted nanobody pair
+#         0 = nanobody pair auto-confirmed; use /dev/null (target prompts → n)
+print('1' if nb_prompted else '0')
 PYEOF
+)
 
 # =============================================================================
 # STEP 1 — pdb2gmx: topology + force field
@@ -212,14 +225,20 @@ PDB2GMX_ARGS=(
 )
 
 [[ "$SS_N" -gt 0 ]] && log "SSBOND record(s) found in source PDB."
-# -ss scans for CYS SG pairs within specbond.dat threshold (2.5 Å) and prompts.
-# The coordinate snap above puts all candidates at 1.99 Å — below the specbond.dat
-# reference length (0.2 nm = 2.00 Å), where GROMACS 2026 auto-forms the bond
-# without requiring interactive stdin input.
-set +o pipefail
-yes y 2>/dev/null | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
-PDB2GMX_RC="${PIPESTATUS[1]}"
-set -o pipefail
+if [[ "$SS_NEEDS_Y" -eq 1 ]]; then
+    # Nanobody CYS pair at 2.0–2.1 Å: pdb2gmx -ss will prompt for it.
+    # Send exactly one "y" (for the nanobody pair) then close stdin — subsequent
+    # prompts (target-protein CYS pairs) receive EOF and default to "n".
+    set +o pipefail
+    printf 'y\n' | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
+    PDB2GMX_RC="${PIPESTATUS[1]}"
+    set -o pipefail
+else
+    # Nanobody CYS pair is auto-confirmed (< 2.0 Å after snap or naturally).
+    # Feed /dev/null so any target-protein CYS prompts default to "n".
+    ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss < /dev/null
+    PDB2GMX_RC="$?"
+fi
 [[ "$PDB2GMX_RC" -eq 0 ]] || die "pdb2gmx failed (exit ${PDB2GMX_RC})"
 ok "pdb2gmx done → processed.gro, topol.top"
 
