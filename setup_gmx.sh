@@ -461,7 +461,7 @@ ${GMX} grompp \
 ${GMX} mdrun -v -deffnm nvt \
     -ntomp "${CPU_THREADS}" \
     -gpu_id "${GPU_ID}" \
-    -nb gpu -pme gpu -bonded gpu -update gpu \
+    -nb gpu -pme gpu -bonded gpu -update cpu \
     -pin on
 
 ok "NVT equilibration done → nvt.gro"
@@ -483,7 +483,7 @@ ${GMX} grompp \
 ${GMX} mdrun -v -deffnm npt \
     -ntomp "${CPU_THREADS}" \
     -gpu_id "${GPU_ID}" \
-    -nb gpu -pme gpu -bonded gpu -update gpu \
+    -nb gpu -pme gpu -bonded gpu -update cpu \
     -pin on
 
 ok "NPT equilibration done → npt.gro"
