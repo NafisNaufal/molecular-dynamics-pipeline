@@ -144,13 +144,15 @@ ok "clean_input.pdb written: $ATOM_CLEAN ATOM records retained"
 #   • nanobody pair snapped to 1.99 Å → auto-confirmed (no prompt) → use /dev/null
 #   • nanobody pair at 2.0–2.1 Å (not snapped) → prompted → send exactly one "y",
 #     then close stdin so subsequent target-CYS prompts default to "n"
-SS_NEEDS_Y=$(python3 - << 'PYEOF'
+python3 - << 'PYEOF'
 import sys, math
 
-SS_IDEAL   = 1.99   # Å — snap target; below specbond.dat ref (2.0 Å) → auto-confirmed
-SS_SNAP_LO = 2.1    # Å — snap only if distance is above this
-SS_DETECT  = 3.0    # Å — scan radius for disulfide candidates
-SS_REF     = 2.0    # Å — specbond.dat reference; pairs below this are auto-confirmed
+# Snap intra-chain CYS SG pairs in (2.1, 3.0) Å to 1.99 Å so pdb2gmx -ss
+# detects and prompts for them.  Only same-chain pairs are processed to avoid
+# creating spurious inter-chain disulfides.
+SS_IDEAL   = 1.99   # Å — snap target (within specbond.dat 2.5 Å detection radius)
+SS_SNAP_LO = 2.1    # Å — only snap if distance is above this
+SS_DETECT  = 3.0    # Å — scan radius for candidates
 
 pdb = 'clean_input.pdb'
 with open(pdb) as f:
@@ -168,19 +170,15 @@ for idx, line in enumerate(lines):
         z = float(line[46:54])
         cys_sg.append((chain, resnum, x, y, z, idx))
 
-snapped      = False
-nb_prompted  = False   # True if a same-chain pair is in [2.0, 2.1) — pdb2gmx will prompt
-
+snapped = False
 for i in range(len(cys_sg)):
     for j in range(i + 1, len(cys_sg)):
         c1, r1, x1, y1, z1, li1 = cys_sg[i]
         c2, r2, x2, y2, z2, li2 = cys_sg[j]
         if c1 != c2:
-            continue          # skip inter-chain pairs — no cross-chain disulfides
+            continue          # skip inter-chain pairs
         d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
-
         if SS_SNAP_LO < d < SS_DETECT:
-            # Move both SG atoms symmetrically to SS_IDEAL
             mx = (x1+x2)/2;  my = (y1+y2)/2;  mz = (z1+z2)/2
             dx = x1-x2;      dy = y1-y2;      dz = z1-z2
             half = (SS_IDEAL / 2) / d
@@ -192,21 +190,10 @@ for i in range(len(cys_sg)):
                   file=sys.stderr)
             snapped = True
 
-        elif SS_REF <= d < SS_SNAP_LO:
-            # [2.0, 2.1) Å: pdb2gmx -ss will prompt (not auto-confirmed, not snapped)
-            nb_prompted = True
-            print(f'  [SS-prompt] CYS-{c1}{r1}--CYS-{c2}{r2}: {d:.2f} Å (will prompt → y)',
-                  file=sys.stderr)
-
 if snapped:
     with open(pdb, 'w') as f:
         f.writelines(lines)
-
-# stdout: 1 = send one explicit "y" for the prompted nanobody pair
-#         0 = nanobody pair auto-confirmed; use /dev/null (target prompts → n)
-print('1' if nb_prompted else '0')
 PYEOF
-)
 
 # =============================================================================
 # STEP 1 — pdb2gmx: topology + force field
@@ -225,20 +212,16 @@ PDB2GMX_ARGS=(
 )
 
 [[ "$SS_N" -gt 0 ]] && log "SSBOND record(s) found in source PDB."
-if [[ "$SS_NEEDS_Y" -eq 1 ]]; then
-    # Nanobody CYS pair at 2.0–2.1 Å: pdb2gmx -ss will prompt for it.
-    # Send exactly one "y" (for the nanobody pair) then close stdin — subsequent
-    # prompts (target-protein CYS pairs) receive EOF and default to "n".
-    set +o pipefail
-    printf 'y\n' | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
-    PDB2GMX_RC="${PIPESTATUS[1]}"
-    set -o pipefail
-else
-    # Nanobody CYS pair is auto-confirmed (< 2.0 Å after snap or naturally).
-    # Feed /dev/null so any target-protein CYS prompts default to "n".
-    ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss < /dev/null
-    PDB2GMX_RC="$?"
-fi
+# Send exactly one "y" then close stdin.
+# pdb2gmx -ss scans in atom-index order; the nanobody chain (A, lower indices)
+# is always first, so the first prompt is always the nanobody CYS22–CYS96/99
+# pair → gets "y".  Any subsequent prompts (target-protein CYS pairs) receive
+# EOF and default to "n", preventing spurious disulfides that corrupt the 1-4
+# pair table and cause do_pairs segfaults.
+set +o pipefail
+printf 'y\n' | ${GMX} pdb2gmx "${PDB2GMX_ARGS[@]}" -ss
+PDB2GMX_RC="${PIPESTATUS[1]}"
+set -o pipefail
 [[ "$PDB2GMX_RC" -eq 0 ]] || die "pdb2gmx failed (exit ${PDB2GMX_RC})"
 ok "pdb2gmx done → processed.gro, topol.top"
 
