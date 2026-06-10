@@ -321,9 +321,11 @@ cat > minim2.mdp << MDP
 ; Steepest descent stalls at machine precision when H atoms placed by -ignh
 ; have bad geometry; L-BFGS uses gradient history to escape these flat regions.
 ; Requires single-threaded CPU execution (not parallelised in GROMACS).
+; constraints = none is mandatory — L-BFGS + constraints is not implemented.
 integrator              = l-bfgs
 emtol                   = 500.0
 nsteps                  = 5000
+constraints             = none
 
 cutoff-scheme           = Verlet
 ns_type                 = grid
